@@ -2,7 +2,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Award, ArrowLeft, Clipboard, CheckCircle, SkipForward, Cpu, Clock, Download, Loader2, BarChart2 } from 'lucide-react';
 import Navbar from '../components/Navbar';
-import { useStore } from '../store';
+import { useStore, useSession } from '../store';
 import { apiPost } from '../api';
 
 function formatTime(secs) {
@@ -25,7 +25,6 @@ function isMuted(answer) {
   return !answer || answer === '(Skipped)' || answer === '(Voice recording)';
 }
 
-// Extract score + metrics for a specific profile_id from any API response
 function extractProfileResult(data, profileId) {
   if (!data || !profileId) return null;
   const sections = data?.set ?? data?.res ?? [];
@@ -42,7 +41,6 @@ function extractProfileResult(data, profileId) {
   return null;
 }
 
-// Animated count-up for the score ring
 function useCountUp(target, duration = 1200) {
   const [display, setDisplay] = useState(0);
   useEffect(() => {
@@ -62,31 +60,30 @@ function useCountUp(target, duration = 1200) {
   return display;
 }
 
-export default function Results() {
-  const { state, patch } = useStore();
+export default function Results({ sessionId }) {
+  const { patch } = useStore();
+  const { session } = useSession(sessionId);
 
-  const [result, setResult]   = useState(null);   // { score: string, metrics: [] }
+  const [result, setResult]   = useState(null);
   const [polling, setPolling] = useState(true);
   const pollRef = useRef(null);
 
-  const answered  = state.answers.filter(a => a.answer !== '(Skipped)' && a.answer !== '(Voice recording)').length;
-  const total     = state.answers.length || 1;
-  const aiAnswered = state.answers.filter(a => a.answer && a.answer.length > 150).length;
-  const tabCount  = state.violations?.tab || 0;
+  const answers   = session?.answers || [];
+  const answered  = answers.filter(a => a.answer !== '(Skipped)' && a.answer !== '(Voice recording)').length;
+  const total     = answers.length || 1;
+  const aiAnswered = answers.filter(a => a.answer && a.answer.length > 150).length;
+  const tabCount  = session?.violations?.tab || 0;
+  const profileId = session?.profileid?.profile_id;
 
-  const profileId = state.profileid?.profile_id;
-
-  // Try serverResults first, then poll fetch-interviews
   useEffect(() => {
-    // Immediate check from update-interview-profile response
-    const immediate = extractProfileResult(state.serverResults, profileId);
+    const immediate = extractProfileResult(session?.serverResults, profileId);
     if (immediate) {
       setResult(immediate);
       setPolling(false);
       return;
     }
 
-    if (!profileId || !state.userid) { setPolling(false); return; }
+    if (!profileId || !session?.userid) { setPolling(false); return; }
 
     let attempt = 0;
     let cancelled = false;
@@ -96,12 +93,12 @@ export default function Results() {
       attempt++;
       try {
         const res = await apiPost('student/api/student/fetch-interviews', {
-          userid:         state.userid,
+          userid:         session.userid,
           archive:        0,
-          interview_type: state.interviewType,
-          jsr_email:      state.email,
-          access_token:   state.accessToken,
-          college_id:     state.collegeId,
+          interview_type: session.interviewType,
+          jsr_email:      session.email,
+          access_token:   session.accessToken,
+          college_id:     session.collegeId,
         });
         const found = extractProfileResult(res, profileId);
         if (found) {
@@ -114,7 +111,7 @@ export default function Results() {
 
     poll();
     return () => { cancelled = true; clearTimeout(pollRef.current); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const animatedScore = useCountUp(result ? parseFloat(result.score) : null);
@@ -122,18 +119,17 @@ export default function Results() {
 
   function downloadInterview() {
     const date = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-    const type = state.interviewType === 'COMPREHENSIVE' ? 'Comprehensive' : 'Skill';
+    const type = session?.interviewType === 'HR' ? 'HR' : 'Skill';
     const lines = [
       '════════════════════════════════════════════════════════════════',
       '                    SKIPIT — INTERVIEW REPORT',
       '════════════════════════════════════════════════════════════════',
       `Date         : ${date}`,
       `Interview    : ${type} Interview`,
-      `Total Time   : ${formatTime(state.timerSecs || 0)}`,
-      `Questions    : ${state.answers.length}`,
+      `Total Time   : ${formatTime(session?.timerSecs || 0)}`,
+      `Questions    : ${answers.length}`,
       `Answered     : ${answered}`,
       `AI-Assisted  : ${aiAnswered}`,
-      `Tab Switches : ${tabCount}`,
       result ? `Score        : ${result.score}%` : '',
       '════════════════════════════════════════════════════════════════',
       '',
@@ -141,7 +137,7 @@ export default function Results() {
       '────────────────────────────────────────────────────────────────',
       '',
     ];
-    state.answers.forEach((item, i) => {
+    answers.forEach((item, i) => {
       lines.push(`Q${i + 1}. [${item.subject || 'General'}]  @${item.time || ''}`);
       lines.push(`${item.question}`);
       lines.push('');
@@ -229,7 +225,7 @@ export default function Results() {
           </div>
 
           <div className="card result-card">
-            <div className="result-value" style={{ color: 'var(--info)' }}>{formatTime(state.timerSecs || 0)}</div>
+            <div className="result-value" style={{ color: 'var(--info)' }}>{formatTime(session?.timerSecs || 0)}</div>
             <div className="result-label">
               <Clock size={12} style={{ display: 'inline', marginRight: 4, verticalAlign: 'middle' }} />
               Total Time
@@ -278,11 +274,9 @@ export default function Results() {
                     </div>
                     <div style={{ height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
                       <div style={{
-                        height: '100%',
-                        width: `${pct}%`,
+                        height: '100%', width: `${pct}%`,
                         background: pct >= 70 ? 'var(--success)' : pct >= 40 ? 'var(--accent)' : 'var(--warning)',
-                        borderRadius: 3,
-                        transition: 'width 1s ease',
+                        borderRadius: 3, transition: 'width 1s ease',
                       }} />
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
@@ -302,7 +296,7 @@ export default function Results() {
         </div>
 
         <div className="qa-list">
-          {state.answers.map((item, i) => (
+          {answers.map((item, i) => (
             <div key={i} className="card qa-item">
               <div className="qa-q">Q{i + 1}. {item.question}</div>
               <div className="qa-a" style={isMuted(item.answer) ? { color: 'var(--text-muted)' } : undefined}>

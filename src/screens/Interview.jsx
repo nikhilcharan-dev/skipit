@@ -1,6 +1,6 @@
 'use client';
 import React, { useEffect, useRef, useState } from 'react';
-import { useStore } from '../store';
+import { useStore, useSession } from '../store';
 import {
   apiPost, bedrockAnswer, buildFirstQPayload, buildNextQPayload,
   buildAudioPsurlPayload, buildInterviewFinalPayload, normalizeQ, formatTime,
@@ -8,11 +8,12 @@ import {
 } from '../api';
 import {
   Clock, Mic, MicOff, SkipForward, ArrowRight, XCircle,
-  Zap, Monitor, Maximize, Cpu, Layers,
+  Zap, Monitor, Maximize, Cpu, Layers, LayoutDashboard,
 } from 'lucide-react';
 
-export default function Interview() {
-  const { state, patch, addLog, updateLog, resetInterview } = useStore();
+export default function Interview({ sessionId }) {
+  const { state: globalState, patch } = useStore();
+  const { session, patchSession, addLog, updateLog } = useSession(sessionId);
 
   // ── Local UI state ────────────────────────────────────────────────────────
   const [textAnswer, setTextAnswer] = useState('');
@@ -28,16 +29,14 @@ export default function Interview() {
   const questionsRef = useRef([]);
   const currentQRef = useRef(0);
   const answersRef = useRef([]);
-  // qno → { url, fields } presigned POST data for audio upload
   const audioPsurlsRef = useRef({});
-  // qno → actual TTS buffer byte size (sent in fetch-next-question / generate-performance-metrics)
   const audioSizesRef = useRef({});
 
-  // Keep refs in sync with store
-  useEffect(() => { autoModeRef.current = state.autoMode; }, [state.autoMode]);
-  useEffect(() => { questionsRef.current = state.questions; }, [state.questions]);
-  useEffect(() => { currentQRef.current = state.currentQ; }, [state.currentQ]);
-  useEffect(() => { answersRef.current = state.answers; }, [state.answers]);
+  // Keep refs in sync with session
+  useEffect(() => { autoModeRef.current = session?.autoMode; }, [session?.autoMode]);
+  useEffect(() => { questionsRef.current = session?.questions || []; }, [session?.questions]);
+  useEffect(() => { currentQRef.current = session?.currentQ || 0; }, [session?.currentQ]);
+  useEffect(() => { answersRef.current = session?.answers || []; }, [session?.answers]);
 
   // ── Timer ─────────────────────────────────────────────────────────────────
   function startTimer() {
@@ -48,39 +47,31 @@ export default function Interview() {
     }, 1000);
   }
 
-  function stopTimer() {
-    clearInterval(timerRef.current);
-  }
+  function stopTimer() { clearInterval(timerRef.current); }
 
   // ── Subject helpers ───────────────────────────────────────────────────────
   function getSelSubs() {
-    return state.selectedSubjects.map(id => {
-      const s = state.subjects.find(s => s.id === id);
+    const selectedSubjects = session?.selectedSubjects || [];
+    const subjects = session?.subjects || [];
+    return selectedSubjects.map(id => {
+      const s = subjects.find(s => s.id === id);
       return s
         ? { id: s.id, label: s.label || s.display_name, value: s.value || s.display_name, display_name: s.display_name || s.label }
         : { id, label: 'Subject', value: 'Subject', display_name: 'Subject' };
     });
   }
 
-  // ── Tab-switch handler ────────────────────────────────────────────────────
-  function onTabSwitch() {
-    if (document.hidden) {
-      patch({ violations: { ...state.violations, tab: state.violations.tab + 1 } });
-    }
-  }
-
   // ── End interview ─────────────────────────────────────────────────────────
   async function endInterview() {
     stopTimer();
-    document.removeEventListener('visibilitychange', onTabSwitch);
 
     const lastQ = questionsRef.current[currentQRef.current];
     let serverResults = null;
     if (lastQ) {
       const selSubs = getSelSubs();
-      const stateSnap = { ...state, sessionState: sessionStateRef.current };
-      const finalPayload = buildInterviewFinalPayload(stateSnap, selSubs, lastQ, timerSecsRef.current, false);
-      const updatePayload = buildInterviewFinalPayload(stateSnap, selSubs, lastQ, timerSecsRef.current, true);
+      const snap = { ...session, sessionState: sessionStateRef.current };
+      const finalPayload  = buildInterviewFinalPayload(snap, selSubs, lastQ, timerSecsRef.current, false);
+      const updatePayload = buildInterviewFinalPayload(snap, selSubs, lastQ, timerSecsRef.current, true);
 
       try {
         console.log('[endInterview] recording canvas video...');
@@ -90,22 +81,17 @@ export default function Interview() {
         finalPayload.video.file.type  = videoBlob.type;
         updatePayload.video.file.size = videoBlob.size;
         updatePayload.video.file.type = videoBlob.type;
-        console.log('[endInterview] video filename:', finalPayload.video.file.name);
 
         console.log('[endInterview] calling interview-presigned-url...');
         const psRes = await apiPost(
           'update-profile/api/sdt/update-profile/interview-presigned-url', finalPayload
         );
-        console.log('[endInterview] psurl sts:', psRes?.sts?.sts, '| has_psurl:', !!(psRes?.video?.psurl?.url));
         const videoPsurl = psRes?.video?.psurl;
         if (videoPsurl?.url) {
-          console.log('[endInterview] uploading video to S3, key:', videoPsurl.fields?.key);
           const s3ok = await uploadAudioToS3(
             videoPsurl, await videoBlob.arrayBuffer(), finalPayload.video.file.name, videoBlob.type
           );
           console.log('[endInterview] S3 upload ok:', s3ok);
-        } else {
-          console.warn('[endInterview] no psurl — skipping S3 upload');
         }
       } catch (e) { console.error('[endInterview] video/psurl error:', e.message); }
 
@@ -114,11 +100,10 @@ export default function Interview() {
         serverResults = await apiPost(
           'update-profile/api/sdt/update-profile/update-interview-profile', updatePayload
         );
-        console.log('[endInterview] update-interview-profile sts:', serverResults?.sts?.sts, '| msg:', serverResults?.sts?.msg);
       } catch (e) { console.error('[endInterview] update-interview-profile error:', e.message); }
     }
 
-    patch({ screen: 'results', timerSecs: timerSecsRef.current, serverResults });
+    patchSession({ status: 'results', timerSecs: timerSecsRef.current, serverResults });
   }
 
   // ── Fetch next question ───────────────────────────────────────────────────
@@ -126,20 +111,17 @@ export default function Interview() {
     const selSubs = getSelSubs();
     const nextIdx = currentQRef.current + 1;
 
-    // Client-side guard: stop once max_count is reached
     if (nextIdx >= (prevQ.max_count || 16)) {
       endInterview();
       return;
     }
 
     setLoading(true);
-
-    // Inject real audio size (captured from TTS response) so the server knows audio was recorded.
-    // Real site sends actual byte size (e.g. 98828); size:0 tells the server no audio was uploaded.
     const actualAudioSize = audioSizesRef.current[prevQ.qno] || 0;
+    const snap = { ...session, sessionState: sessionStateRef.current };
 
     // Fire-and-forget performance metrics
-    const metricsPayload = buildNextQPayload({ ...state, sessionState: sessionStateRef.current }, selSubs, prevQ, answerText, timerSecsRef.current);
+    const metricsPayload = buildNextQPayload(snap, selSubs, prevQ, answerText, timerSecsRef.current);
     metricsPayload.audio_file.file.size = actualAudioSize;
     apiPost(
       'performance-metrics/api/sdt/update-profile/generate-performance-metrics-for-each-question',
@@ -148,10 +130,7 @@ export default function Interview() {
 
     addLog('fnq-' + nextIdx, `Fetching Q${nextIdx + 1}…`, 'active');
     try {
-      const payload = buildNextQPayload(
-        { ...state, sessionState: sessionStateRef.current },
-        selSubs, prevQ, answerText, timerSecsRef.current
-      );
+      const payload = buildNextQPayload(snap, selSubs, prevQ, answerText, timerSecsRef.current);
       payload.audio_file.file.size = actualAudioSize;
       const r = await apiPost(
         'interview-questions/api/sdt/update-profile/fetch-next-question',
@@ -160,11 +139,10 @@ export default function Interview() {
       const q = r?.q || r?.data?.q || (r?.question ? r : null);
       if (q?.question) {
         const newQ = normalizeQ(q, selSubs, timerSecsRef.current);
-        patch({ questions: [...questionsRef.current, newQ], currentQ: nextIdx });
+        patchSession({ questions: [...questionsRef.current, newQ], currentQ: nextIdx });
         updateLog('fnq-' + nextIdx, `Q${nextIdx + 1} ready`, 'done');
-        // capture presigned URL for next question's audio upload
         apiPost('interview-questions/api/sdt/update-profile/generate-psurl-for-audio',
-          buildAudioPsurlPayload({ ...state, sessionState: sessionStateRef.current }, selSubs, newQ, null, timerSecsRef.current)
+          buildAudioPsurlPayload(snap, selSubs, newQ, null, timerSecsRef.current)
         ).then(r => {
           const psurl = r?.audio_file?.psurl;
           if (psurl?.url) audioPsurlsRef.current[newQ.qno] = psurl;
@@ -194,12 +172,9 @@ export default function Interview() {
         time: formatTime(timerSecsRef.current),
       },
     ];
-    patch({ answers: newAnswers });
+    patchSession({ answers: newAnswers });
     setTextAnswer('');
 
-    // TTS → S3 upload so the server can transcribe and score properly.
-    // We await the TTS *fetch* (not the upload) so we know the buffer size to include
-    // in the fetch-next-question payload — matching what the real site sends.
     const isSkipped = !answerText || answerText === '(Skipped)';
     if (!isSkipped) {
       const psurl = audioPsurlsRef.current[prevQ.qno];
@@ -209,7 +184,7 @@ export default function Interview() {
         if (result) {
           audioSizesRef.current[prevQ.qno] = result.buffer.byteLength;
           if (psurl) {
-            const filename = `${state.userid?.user_cat_id}-${state.profileid?.profile_id || 24}-question-${prevQ.qno}.wav`;
+            const filename = `${session?.userid?.user_cat_id}-${session?.profileid?.profile_id || 24}-question-${prevQ.qno}.wav`;
             uploadAudioToS3(psurl, result.buffer, filename, 'audio/wav').catch(() => {});
           }
         }
@@ -219,7 +194,6 @@ export default function Interview() {
     await fetchNext(prevQ, answerText);
   }
 
-  // ── Skip question ─────────────────────────────────────────────────────────
   function handleSkip() {
     if (loading) return;
     submitAnswer('(Skipped)');
@@ -228,34 +202,41 @@ export default function Interview() {
   // ── Init on mount ─────────────────────────────────────────────────────────
   useEffect(() => {
     async function initInterview() {
-      resetInterview();
       startTimer();
-      document.addEventListener('visibilitychange', onTabSwitch);
 
       const selSubs = getSelSubs();
+      const isHR = session?.interviewType === 'HR';
 
       // Stage 1: resume-presigned-url
-      addLog('rpu', 'Getting resume URL…', 'active');
-      let psurl = {};
+      addLog('rpu', isHR ? 'Uploading resume…' : 'Getting resume URL…', 'active');
+      let resumePsurl = {};
       try {
         const r = await apiPost(
           'update-profile/api/sdt/update-resume/resume-presigned-url',
           {
-            userid: state.userid,
-            resume: { file: {}, psurl: {} },
-            profileid: {
-              dept: state.profileid.dept,
-              sem: state.profileid.sem,
-              set_id: state.profileid.set_id,
-              profile_id: state.profileid.profile_id,
-              date: state.profileid.date,
+            userid: session?.userid,
+            resume: {
+              file: isHR && session?.resumeFileMeta ? session.resumeFileMeta : {},
+              psurl: {},
             },
-            interview_type_code: state.interviewType,
-            access_token: state.accessToken,
+            profileid: {
+              dept:       session?.profileid?.dept,
+              sem:        session?.profileid?.sem,
+              set_id:     session?.profileid?.set_id,
+              profile_id: session?.profileid?.profile_id,
+              date:       session?.profileid?.date,
+            },
+            interview_type_code: session?.interviewType,
+            access_token:        session?.accessToken,
           }
         );
-        psurl = r?.psurl || {};
-        updateLog('rpu', 'Resume URL ready', 'done');
+        resumePsurl = r?.resume?.psurl || r?.psurl || {};
+        if (isHR && session?.resumeFile && resumePsurl?.url) {
+          const buf = await session.resumeFile.arrayBuffer();
+          await uploadAudioToS3(resumePsurl, buf, session.resumeFileMeta.name, session.resumeFileMeta.type).catch(() => {});
+          console.log('[initInterview] resume uploaded to S3');
+        }
+        updateLog('rpu', isHR ? 'Resume uploaded' : 'Resume URL ready', 'done');
       } catch {
         updateLog('rpu', 'Resume URL skipped', 'done');
       }
@@ -267,17 +248,20 @@ export default function Interview() {
         const r = await apiPost(
           'update-profile/api/sdt/update-resume/process-uploaded-resume',
           {
-            userid: state.userid,
-            resume: { file: {}, psurl },
-            profileid: state.profileid,
-            access_token: state.accessToken,
-            interview_type_code: state.interviewType,
-            subjects_selected: selSubs,
+            userid:              session?.userid,
+            resume: {
+              file: isHR && session?.resumeFileMeta ? session.resumeFileMeta : {},
+              psurl: {},
+            },
+            profileid:           session?.profileid,
+            access_token:        session?.accessToken,
+            interview_type_code: session?.interviewType,
+            subjects_selected:   selSubs,
           }
         );
         sessionState = r || {};
         sessionStateRef.current = sessionState;
-        patch({ sessionState, interviewPanel: r?.interview_panel || [] });
+        patchSession({ sessionState, interviewPanel: r?.interview_panel || [] });
         updateLog('pur', 'Profile processed', 'done');
       } catch {
         updateLog('pur', 'Using default session', 'done');
@@ -286,22 +270,21 @@ export default function Interview() {
       // Stage 3: fetch-first-question
       addLog('ffq', 'Loading first question…', 'active');
       try {
-        const stateForPayload = { ...state, sessionState };
-        const payload = buildFirstQPayload(stateForPayload, selSubs);
+        const snap = { ...session, sessionState };
+        const payload = buildFirstQPayload(snap, selSubs);
         const r = await apiPost(
           'interview-questions/api/sdt/update-profile/fetch-first-question',
           payload
         );
         const panel = r?.interview_panel || r?.data?.interview_panel;
-        if (panel) patch({ interviewPanel: panel });
+        if (panel) patchSession({ interviewPanel: panel });
         const q = r?.q || r?.data?.q || (r?.question ? r : null);
         if (q?.question) {
           const firstQ = normalizeQ(q, selSubs, timerSecsRef.current);
-          patch({ questions: [firstQ], currentQ: 0 });
+          patchSession({ questions: [firstQ], currentQ: 0 });
           updateLog('ffq', 'Q1 ready', 'done');
-          // capture presigned URL for Q1 audio upload
           apiPost('interview-questions/api/sdt/update-profile/generate-psurl-for-audio',
-            buildAudioPsurlPayload({ ...state, sessionState }, selSubs, firstQ, null, timerSecsRef.current)
+            buildAudioPsurlPayload({ ...session, sessionState }, selSubs, firstQ, null, timerSecsRef.current)
           ).then(r => {
             const psurl = r?.audio_file?.psurl;
             if (psurl?.url) audioPsurlsRef.current[firstQ.qno] = psurl;
@@ -315,45 +298,45 @@ export default function Interview() {
     }
 
     initInterview();
-
-    return () => {
-      stopTimer();
-      document.removeEventListener('visibilitychange', onTabSwitch);
-    };
+    return () => { stopTimer(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Auto-mode: AI answers when currentQ changes ───────────────────────────
   useEffect(() => {
-    if (!state.autoMode || !state.questions[state.currentQ]) return;
+    if (!session?.autoMode || !session?.questions?.[session?.currentQ]) return;
     let cancelled = false;
-    const q = state.questions[state.currentQ];
-    const providerLabel = state.aiProvider === 'nvidia' ? 'NVIDIA' : 'Bedrock';
-    addLog('ai-' + state.currentQ, `${providerLabel} answering Q${state.currentQ + 1}…`, 'active');
-    bedrockAnswer(q.question, q.subject, state.aiProvider).then(answer => {
+    const q = session.questions[session.currentQ];
+    const providerLabel = session.aiProvider === 'nvidia' ? 'NVIDIA' : 'Bedrock';
+    addLog('ai-' + session.currentQ, `${providerLabel} answering Q${session.currentQ + 1}…`, 'active');
+    const resumeCtx = session.interviewType === 'HR'
+      ? (sessionStateRef.current?.introq?.resume_data || session.sessionState?.introq?.resume_data || null)
+      : null;
+    const nvidiaKey = globalState.nvidiaApiKey || '';
+    bedrockAnswer(q.question, q.subject, session.aiProvider, resumeCtx, nvidiaKey).then(answer => {
       if (cancelled) return;
       if (answer) {
         setTextAnswer(answer);
-        updateLog('ai-' + state.currentQ, `${providerLabel} answer ready`, 'done');
+        updateLog('ai-' + session.currentQ, `${providerLabel} answer ready`, 'done');
         setTimeout(() => {
           if (!cancelled && autoModeRef.current) submitAnswer(answer);
         }, 2000);
       } else {
-        updateLog('ai-' + state.currentQ, `${providerLabel} failed`, 'error');
+        updateLog('ai-' + session.currentQ, `${providerLabel} failed`, 'error');
       }
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.currentQ, state.autoMode, state.questions.length]);
+  }, [session?.currentQ, session?.autoMode, session?.questions?.length]);
 
   // ── Derived values ────────────────────────────────────────────────────────
-  const currentQuestion = state.questions[state.currentQ] || null;
-  const totalQ = state.questions.length;
+  const currentQuestion = session?.questions?.[session?.currentQ] || null;
+  const totalQ = session?.questions?.length || 0;
   const progressPct = totalQ > 0
-    ? Math.round(((state.currentQ) / Math.max(currentQuestion?.max_count || 16, totalQ)) * 100)
+    ? Math.round(((session?.currentQ || 0) / Math.max(currentQuestion?.max_count || 16, totalQ)) * 100)
     : 0;
 
-  const panelMember = state.interviewPanel?.[0] || null;
+  const panelMember = session?.interviewPanel?.[0] || null;
   const panelName = panelMember?.name || panelMember?.display_name || 'AI Interviewer';
   const panelRole = panelMember?.role || panelMember?.designation || 'Senior Engineer';
   const panelLetter = panelName.charAt(0).toUpperCase();
@@ -365,7 +348,7 @@ export default function Interview() {
       <header className="interview-header">
         <div className="interview-header-left">
           <span className="q-counter">
-            Q {state.currentQ + 1} / {currentQuestion?.max_count || '—'}
+            Q {(session?.currentQ || 0) + 1} / {currentQuestion?.max_count || '—'}
           </span>
           <div style={{ width: 120 }}>
             <div className="progress-bar">
@@ -383,15 +366,15 @@ export default function Interview() {
           {/* AI provider toggle */}
           <div className="provider-toggle">
             <button
-              className={`provider-btn${state.aiProvider === 'bedrock' ? ' active' : ''}`}
-              onClick={() => patch({ aiProvider: 'bedrock' })}
+              className={`provider-btn${session?.aiProvider === 'bedrock' ? ' active' : ''}`}
+              onClick={() => patchSession({ aiProvider: 'bedrock' })}
               title="Use AWS Bedrock"
             >
               <Layers size={12} /> Bedrock
             </button>
             <button
-              className={`provider-btn${state.aiProvider === 'nvidia' ? ' active' : ''}`}
-              onClick={() => patch({ aiProvider: 'nvidia' })}
+              className={`provider-btn${session?.aiProvider === 'nvidia' ? ' active' : ''}`}
+              onClick={() => patchSession({ aiProvider: 'nvidia' })}
               title="Use NVIDIA NIM"
             >
               <Cpu size={12} /> NVIDIA
@@ -399,12 +382,21 @@ export default function Interview() {
           </div>
 
           <button
-            className={`btn btn-sm btn-auto${state.autoMode ? ' on' : ''}`}
-            onClick={() => patch({ autoMode: !state.autoMode })}
+            className={`btn btn-sm btn-auto${session?.autoMode ? ' on' : ''}`}
+            onClick={() => patchSession({ autoMode: !session?.autoMode })}
             title="Toggle Auto AI Mode"
           >
             <Zap size={14} />
-            {state.autoMode ? 'Auto ON' : 'Auto'}
+            {session?.autoMode ? 'Auto ON' : 'Auto'}
+          </button>
+
+          <button
+            className="btn btn-sm btn-outline"
+            onClick={() => patch({ screen: 'dashboard' })}
+            title="Back to Dashboard (interview keeps running)"
+          >
+            <LayoutDashboard size={14} />
+            Dashboard
           </button>
 
           <button
@@ -446,7 +438,6 @@ export default function Interview() {
 
           {/* Answer area */}
           <div className="answer-area">
-            {/* Record row */}
             <div className="record-row">
               <button
                 className={`record-btn${isRecording ? ' recording' : ''}`}
@@ -500,15 +491,15 @@ export default function Interview() {
         <div className="violations">
           <span className="violation-item">
             <Monitor size={13} />
-            Tab Switches: {state.violations.tab}
+            Tab Switches: {session?.violations?.tab || 0}
           </span>
           <span className="violation-item">
             <Maximize size={13} />
-            Fullscreen Exits: {state.violations.full}
+            Fullscreen Exits: {session?.violations?.full || 0}
           </span>
         </div>
         <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>
-          {state.interviewType === 'COMPREHENSIVE' ? 'Comprehensive Interview' : 'Skill Interview'}
+          {session?.interviewType === 'HR' ? 'HR Interview' : 'Skill Interview'}
         </span>
       </footer>
     </div>

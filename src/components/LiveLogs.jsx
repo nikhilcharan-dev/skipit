@@ -4,34 +4,31 @@ import { useStore } from '../store';
 import { Activity, X, CheckCircle, AlertCircle, Loader, Circle } from 'lucide-react';
 
 export default function LiveLogs() {
-  const { state, patch } = useStore();
+  const { state } = useStore();
   const bodyRef = useRef(null);
   const [visible, setVisible] = useState(false);
 
+  const activeSession = state.sessions.find(s => s.id === state.activeSessionId);
+  const logs = activeSession?.logs || [];
+
   // Show panel whenever new logs are added
   useEffect(() => {
-    if (state.logs.length > 0) {
-      setVisible(true);
-    }
-  }, [state.logs.length]);
+    if (logs.length > 0) setVisible(true);
+  }, [logs.length]);
 
   // Auto-scroll to bottom on new log entries
   useEffect(() => {
     if (bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [state.logs]);
+  }, [logs]);
 
   function getIcon(status) {
     switch (status) {
-      case 'active':
-        return <Loader size={13} className="spin" />;
-      case 'done':
-        return <CheckCircle size={13} />;
-      case 'error':
-        return <AlertCircle size={13} />;
-      default:
-        return <Circle size={13} />;
+      case 'active': return <Loader size={13} className="spin" />;
+      case 'done':   return <CheckCircle size={13} />;
+      case 'error':  return <AlertCircle size={13} />;
+      default:       return <Circle size={13} />;
     }
   }
 
@@ -41,7 +38,7 @@ export default function LiveLogs() {
     return `${Math.floor(secs / 60)}m ${secs % 60}s`;
   }
 
-  if (!visible || state.logs.length === 0) return null;
+  if (!visible || logs.length === 0) return null;
 
   return (
     <div className="logs-panel">
@@ -49,16 +46,12 @@ export default function LiveLogs() {
         <span className="logs-dot" />
         <Activity size={14} />
         <span>Live Progress</span>
-        <button
-          className="logs-close"
-          onClick={() => setVisible(false)}
-          aria-label="Close logs"
-        >
+        <button className="logs-close" onClick={() => setVisible(false)} aria-label="Close logs">
           <X size={14} />
         </button>
       </div>
       <div className="logs-body" ref={bodyRef}>
-        {state.logs.map(log => (
+        {logs.map(log => (
           <div key={log.id} className={`log-entry ${log.status}`}>
             {getIcon(log.status)}
             <span className="log-msg">{log.msg}</span>

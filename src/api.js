@@ -109,12 +109,12 @@ export async function apiPost(path, body) {
   return res.json();
 }
 
-export async function bedrockAnswer(question, subject, provider = 'bedrock') {
+export async function bedrockAnswer(question, subject, provider = 'bedrock', resumeContext = null, apiKey = '') {
   try {
     const res = await fetch('/api/ai/answer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, subject, provider }),
+      body: JSON.stringify({ question, subject, provider, resumeContext, apiKey }),
     });
     const text = await res.text();
     let data;
@@ -188,16 +188,30 @@ export async function signIn(email, password) {
 // ─── Payload builders (match flow.json exactly) ───────────────────────────────
 
 /**
+ * Build the HR voice object from the interview_panel inside sessionState.
+ * HR interviews use { PIQ, FRQ, SLF, FNL, LST } voice keys, not { INT }.
+ */
+export function buildHRVoice(sessionState) {
+  const panel = sessionState?.introq?.interview_panel || [];
+  const v = panel[0]?.voice_id || { voice_name: 'Emma', language_code: 'en-GB' };
+  const qorder = panel[0]?.qorder || ['PIQ', 'FRQ', 'SLF', 'FNL', 'LST'];
+  return qorder.reduce((acc, k) => ({ ...acc, [k]: v }), {});
+}
+
+/**
  * Payload for fetch-first-question.
  * sessionState comes from process-uploaded-resume response.
  */
 export function buildFirstQPayload(state, selSubs) {
   const ss = state.sessionState || {};
+  const isHR = state.interviewType === 'HR';
   return {
     sts: ss.sts || { sts: true, err: '', msg: 'Successfully generated pre-signed url for introductory SME question.' },
     userid:           state.userid,
     profileid:        state.profileid,
-    resume:           { file: {}, psurl: {} },
+    resume:           isHR && state.resumeFileMeta
+                        ? { file: state.resumeFileMeta, psurl: {} }
+                        : { file: {}, psurl: {} },
     subjects:         ss.subjects         || [],
     resume_subjects:  ss.resume_subjects  || [],
     introq:           ss.introq           || {},
@@ -205,7 +219,7 @@ export function buildFirstQPayload(state, selSubs) {
     subjects_selected: selSubs,
     interview_type_code: state.interviewType,
     video: { file: { name: null, size: 0, type: null, span: null }, psurl: {} },
-    voice: ss.voice || { INT: { voice_name: 'Matthew', language_code: 'en-US' } },
+    voice: isHR ? buildHRVoice(ss) : (ss.voice || { INT: { voice_name: 'Matthew', language_code: 'en-US' } }),
     violations:  { Tabswitch: 0, Fullscreen: 0, Externaldisplay: 0 },
     interview_type: state.interviewType,
     access_token:   state.accessToken,
@@ -218,6 +232,7 @@ export function buildFirstQPayload(state, selSubs) {
  */
 export function buildNextQPayload(state, selSubs, prevQ, answerText, timerSecs) {
   const ss   = state.sessionState || {};
+  const isHR = state.interviewType === 'HR';
   const viol = {
     Tabswitch:      state.violations.tab,
     Fullscreen:     state.violations.full,
@@ -227,7 +242,9 @@ export function buildNextQPayload(state, selSubs, prevQ, answerText, timerSecs) 
     sts: ss.sts || { sts: true, err: '', msg: 'Successfully generated pre-signed url for introductory SME question.' },
     userid:           state.userid,
     profileid:        state.profileid,
-    resume:           { file: {}, psurl: {} },
+    resume:           isHR && state.resumeFileMeta
+                        ? { file: state.resumeFileMeta, psurl: {} }
+                        : { file: {}, psurl: {} },
     subjects:         ss.subjects         || [],
     resume_subjects:  ss.resume_subjects  || [],
     introq:           ss.introq           || {},
@@ -251,7 +268,7 @@ export function buildNextQPayload(state, selSubs, prevQ, answerText, timerSecs) 
     screen_violations: { exitCount: 0, isFullscreen: false, lastExitTime: null, exitHistory: [] },
     total_violations:  viol,
     interview_type:    state.interviewType,
-    voice: ss.voice || { INT: { voice_name: 'Matthew', language_code: 'en-US' } },
+    voice: isHR ? buildHRVoice(ss) : (ss.voice || { INT: { voice_name: 'Matthew', language_code: 'en-US' } }),
     access_token:  state.accessToken,
     audio_file: {
       file: {
